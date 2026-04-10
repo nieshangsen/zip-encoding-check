@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ZIP Filename Encoding Analyzer</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <main class="page-shell">
+      <section class="hero-card">
+        <div class="hero-copy compact-copy">
+          <p class="eyebrow">Local ZIP Probe</p>
+          <h1>ZIP filename analyzer</h1>
+          <p class="lede">
+            Read ZIP metadata locally, compare filename decodings, and keep file contents untouched.
+          </p>
+        </div>
+
+        <div class="controls">
+          <label class="control-card">
+            <span>ZIP file</span>
+            <input id="zip-file" type="file" accept=".zip,application/zip">
+          </label>
+
+          <label class="control-card">
+            <span>Entries to sample</span>
+            <input id="sample-size" type="number" min="1" max="100" value="10">
+          </label>
+
+          <label class="control-card checkbox-card">
+            <span>Oversized central directory</span>
+            <label class="checkbox-line">
+              <input id="allow-large-directory" type="checkbox">
+              <span>Allow analysis above soft limit</span>
+            </label>
+          </label>
+        </div>
+
+        <div class="summary-grid">
+          <article>
+            <span class="summary-label">Status</span>
+            <strong id="summary-status">Waiting for file</strong>
+          </article>
+          <article>
+            <span class="summary-label">ZIP entries</span>
+            <strong id="summary-total">-</strong>
+          </article>
+          <article>
+            <span class="summary-label">Sampled</span>
+            <strong id="summary-sampled">-</strong>
+          </article>
+          <article>
+            <span class="summary-label">Bytes read</span>
+            <strong id="summary-bytes">-</strong>
+          </article>
+        </div>
+
+        <p id="limit-note" class="limit-note compact-note">
+          Soft limit: central directory over 32 MB is blocked unless you explicitly allow it.
+        </p>
+      </section>
+
+      <section class="results-panel">
+        <div class="results-header">
+          <h2>Analysis</h2>
+          <p id="results-hint">Choose a ZIP file to start.</p>
+        </div>
+        <div id="results" class="results-list"></div>
+      </section>
+    </main>
+
+    <template id="entry-template">
+      <article class="entry-card">
+        <header class="entry-header">
+          <div>
+            <p class="entry-index"></p>
+            <h3 class="entry-title"></h3>
+          </div>
+          <div class="flag-badge"></div>
+        </header>
+
+        <dl class="entry-meta">
+          <div>
+            <dt>Hex</dt>
+            <dd class="hex-value"></dd>
+          </div>
+          <div>
+            <dt>Byte length</dt>
+            <dd class="byte-length"></dd>
+          </div>
+          <div>
+            <dt>Flags</dt>
+            <dd class="flag-value"></dd>
+          </div>
+        </dl>
+
+        <div class="decode-list"></div>
+      </article>
+    </template>
+
+    <template id="decode-template">
+      <div class="decode-row">
+        <span class="decode-name"></span>
+        <code class="decode-value"></code>
+      </div>
+    </template>
+
+    <script type="module" src="app.js"></script>
+  </body>
+  </html>
