@@ -30,10 +30,10 @@
           </label>
 
           <label class="control-card checkbox-card">
-            <span>Oversized central directory</span>
+            <span>Larger metadata scan</span>
             <label class="checkbox-line">
               <input id="allow-large-directory" type="checkbox">
-              <span>Allow analysis above soft limit</span>
+              <span>Allow larger filename metadata scan</span>
             </label>
           </label>
         </div>
@@ -58,7 +58,7 @@
         </div>
 
         <p id="limit-note" class="limit-note compact-note">
-          Soft limit: central directory over 32 MB is blocked unless you explicitly allow it.
+          Soft limit: scans above 16 MB of ZIP filename metadata require explicit opt-in.
         </p>
       </section>
 

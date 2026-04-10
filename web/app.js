@@ -1,9 +1,12 @@
 const EOCD_SIGNATURE = 0x06054b50;
+const ZIP64_EOCD_SIGNATURE = 0x06064b50;
+const ZIP64_EOCD_LOCATOR_SIGNATURE = 0x07064b50;
 const CENTRAL_DIRECTORY_SIGNATURE = 0x02014b50;
 const UTF8_FLAG = 0x0800;
 const EOCD_SCAN_BYTES = 65557;
-const SOFT_CENTRAL_DIRECTORY_LIMIT = 32 * 1024 * 1024;
-const HARD_CENTRAL_DIRECTORY_LIMIT = 128 * 1024 * 1024;
+const INITIAL_CENTRAL_DIRECTORY_READ = 1024 * 1024;
+const SOFT_CENTRAL_DIRECTORY_READ_LIMIT = 16 * 1024 * 1024;
+const HARD_CENTRAL_DIRECTORY_READ_LIMIT = 64 * 1024 * 1024;
 
 const DECODERS = [
   { label: 'utf-8', decode: (bytes) => decodeText(bytes, 'utf-8') },
@@ -52,37 +55,29 @@ async function analyzeSelectedFile() {
   updateSummary('Reading ZIP metadata', '-', '-', '-');
   resultsHint.textContent = `Inspecting ${file.name} locally.`;
 
-  const tailStart = Math.max(0, file.size - EOCD_SCAN_BYTES);
-  const tailBuffer = await file.slice(tailStart, file.size).arrayBuffer();
-  const eocdInfo = findEndOfCentralDirectory(new DataView(tailBuffer), tailStart);
-  if (!eocdInfo) {
-    throw new Error('Could not find ZIP end-of-central-directory record.');
-  }
-
+  const eocdInfo = await locateCentralDirectory(file);
   const { totalEntries, centralDirectoryOffset, centralDirectorySize } = eocdInfo;
   const requestedSample = clampSampleSize(Number(sampleInput.value) || 10);
+  const metadataScan = await readCentralDirectorySample({
+    file,
+    centralDirectoryOffset,
+    centralDirectorySize,
+    totalEntries,
+    requestedSample,
+    allowLargeScan: allowLargeDirectoryInput.checked,
+  });
 
-  if (centralDirectorySize > HARD_CENTRAL_DIRECTORY_LIMIT) {
-    throw new Error(
-      `Central directory is ${formatBytes(centralDirectorySize)}, above the hard limit of ${formatBytes(HARD_CENTRAL_DIRECTORY_LIMIT)}.`
-    );
-  }
-
-  if (centralDirectorySize > SOFT_CENTRAL_DIRECTORY_LIMIT && !allowLargeDirectoryInput.checked) {
-    updateSummary('Blocked by soft limit', String(totalEntries), '-', `${formatBytes(tailBuffer.byteLength)}`);
-    resultsHint.textContent = 'The ZIP metadata is larger than the soft limit.';
+  if (metadataScan.blocked) {
+    updateSummary('Blocked by soft limit', String(totalEntries), '-', formatBytes(tailBuffer.byteLength));
+    resultsHint.textContent = 'More central-directory metadata must be scanned to reach your sample.';
     renderEmptyState(
-      `Central directory is ${formatBytes(centralDirectorySize)}. Enable “Allow analysis above soft limit” to continue.`
+      `This ZIP needs more than ${formatBytes(SOFT_CENTRAL_DIRECTORY_READ_LIMIT)} of filename metadata scan. Enable “Allow analysis above soft limit” to continue.`
     );
     return;
   }
 
-  const directoryBuffer = await file
-    .slice(centralDirectoryOffset, centralDirectoryOffset + centralDirectorySize)
-    .arrayBuffer();
-
-  const entries = parseCentralDirectory(directoryBuffer, requestedSample, totalEntries);
-  const bytesRead = tailBuffer.byteLength + directoryBuffer.byteLength;
+  const entries = metadataScan.entries;
+  const bytesRead = eocdInfo.bytesRead + metadataScan.bytesRead;
 
   renderEntries(entries);
   updateSummary('Analysis complete', String(totalEntries), `${entries.length} of ${totalEntries}`, formatBytes(bytesRead));
@@ -91,7 +86,102 @@ async function analyzeSelectedFile() {
     : 'All entries were inspected from metadata only.';
 }
 
-function parseCentralDirectory(arrayBuffer, sampleSize, totalEntries) {
+async function locateCentralDirectory(file) {
+  const tailStart = Math.max(0, file.size - EOCD_SCAN_BYTES);
+  const tailBuffer = await file.slice(tailStart, file.size).arrayBuffer();
+  const tailView = new DataView(tailBuffer);
+  const eocdOffset = findEndOfCentralDirectoryOffset(tailView);
+
+  if (eocdOffset < 0) {
+    throw new Error('Could not find ZIP end-of-central-directory record.');
+  }
+
+  const eocdInfo = {
+    totalEntries: tailView.getUint16(eocdOffset + 10, true),
+    centralDirectorySize: tailView.getUint32(eocdOffset + 12, true),
+    centralDirectoryOffset: tailView.getUint32(eocdOffset + 16, true),
+    bytesRead: tailBuffer.byteLength,
+  };
+
+  const needsZip64 =
+    eocdInfo.totalEntries === 0xffff ||
+    eocdInfo.centralDirectorySize === 0xffffffff ||
+    eocdInfo.centralDirectoryOffset === 0xffffffff;
+
+  if (!needsZip64) {
+    return eocdInfo;
+  }
+
+  const locatorOffset = eocdOffset - 20;
+  if (locatorOffset < 0 || tailView.getUint32(locatorOffset, true) !== ZIP64_EOCD_LOCATOR_SIGNATURE) {
+    throw new Error('ZIP64 locator not found for large ZIP file.');
+  }
+
+  const zip64RecordOffset = toSafeNumber(readUint64LE(tailView, locatorOffset + 8), 'ZIP64 EOCD offset');
+  const zip64HeaderBuffer = await file.slice(zip64RecordOffset, zip64RecordOffset + 56).arrayBuffer();
+  const zip64View = new DataView(zip64HeaderBuffer);
+
+  if (zip64View.byteLength < 56 || zip64View.getUint32(0, true) !== ZIP64_EOCD_SIGNATURE) {
+    throw new Error('ZIP64 end-of-central-directory record not found.');
+  }
+
+  return {
+    totalEntries: toSafeNumber(readUint64LE(zip64View, 32), 'ZIP64 total entries'),
+    centralDirectorySize: toSafeNumber(readUint64LE(zip64View, 40), 'ZIP64 central directory size'),
+    centralDirectoryOffset: toSafeNumber(readUint64LE(zip64View, 48), 'ZIP64 central directory offset'),
+    bytesRead: tailBuffer.byteLength + zip64HeaderBuffer.byteLength,
+  };
+}
+
+async function readCentralDirectorySample({
+  file,
+  centralDirectoryOffset,
+  centralDirectorySize,
+  totalEntries,
+  requestedSample,
+  allowLargeScan,
+}) {
+  const targetEntries = Math.min(requestedSample, totalEntries);
+
+  if (centralDirectorySize > HARD_CENTRAL_DIRECTORY_READ_LIMIT && !allowLargeScan) {
+    throw new Error(
+      `This ZIP needs more than ${formatBytes(HARD_CENTRAL_DIRECTORY_READ_LIMIT)} of central-directory scan for browser analysis.`
+    );
+  }
+
+  let bytesToRead = Math.min(centralDirectorySize, INITIAL_CENTRAL_DIRECTORY_READ);
+
+  while (bytesToRead <= centralDirectorySize) {
+    if (bytesToRead > SOFT_CENTRAL_DIRECTORY_READ_LIMIT && !allowLargeScan) {
+      return { blocked: true, entries: [], bytesRead: 0 };
+    }
+
+    if (bytesToRead > HARD_CENTRAL_DIRECTORY_READ_LIMIT) {
+      throw new Error(
+        `This ZIP needs more than ${formatBytes(HARD_CENTRAL_DIRECTORY_READ_LIMIT)} of central-directory scan for browser analysis.`
+      );
+    }
+
+    const directoryBuffer = await file
+      .slice(centralDirectoryOffset, centralDirectoryOffset + bytesToRead)
+      .arrayBuffer();
+
+    const parseResult = parseCentralDirectory(directoryBuffer, targetEntries, totalEntries, bytesToRead >= centralDirectorySize);
+    if (!parseResult.needsMoreData || parseResult.entries.length >= targetEntries || bytesToRead >= centralDirectorySize) {
+      return {
+        blocked: false,
+        entries: parseResult.entries,
+        bytesRead: directoryBuffer.byteLength,
+      };
+    }
+
+    bytesToRead = Math.min(centralDirectorySize, bytesToRead * 2);
+  }
+
+  return { blocked: false, entries: [], bytesRead: 0 };
+}
+
+function parseCentralDirectory(arrayBuffer, sampleSize, totalEntries, reachedDirectoryEnd = false) {
   const dataView = new DataView(arrayBuffer);
   const entries = [];
   let cursor = 0;
@@ -100,7 +190,10 @@ function parseCentralDirectory(arrayBuffer, sampleSize, totalEntries) {
   while (cursor + 46 <= dataView.byteLength && seenEntries < totalEntries && entries.length < sampleSize) {
     const signature = dataView.getUint32(cursor, true);
     if (signature !== CENTRAL_DIRECTORY_SIGNATURE) {
-      break;
+      return {
+        entries,
+        needsMoreData: false,
+      };
     }
 
     const flagBits = dataView.getUint16(cursor + 8, true);
@@ -110,6 +203,15 @@ function parseCentralDirectory(arrayBuffer, sampleSize, totalEntries) {
     const extraFieldLength = dataView.getUint16(cursor + 30, true);
     const fileCommentLength = dataView.getUint16(cursor + 32, true);
     const externalAttributes = dataView.getUint32(cursor + 38, true);
+    const recordLength = 46 + fileNameLength + extraFieldLength + fileCommentLength;
+
+    if (cursor + recordLength > dataView.byteLength) {
+      return {
+        entries,
+        needsMoreData: !reachedDirectoryEnd,
+      };
+    }
+
     const nameStart = cursor + 46;
     const nameEnd = nameStart + fileNameLength;
     const rawName = new Uint8Array(arrayBuffer.slice(nameStart, nameEnd));
@@ -129,27 +231,40 @@ function parseCentralDirectory(arrayBuffer, sampleSize, totalEntries) {
     });
 
     seenEntries += 1;
-    cursor += 46 + fileNameLength + extraFieldLength + fileCommentLength;
+    cursor += recordLength;
   }
 
-  return entries;
+  return {
+    entries,
+    needsMoreData: seenEntries < totalEntries && entries.length < sampleSize && !reachedDirectoryEnd,
+  };
 }
 
-function findEndOfCentralDirectory(dataView, absoluteOffset) {
+function findEndOfCentralDirectoryOffset(dataView) {
   for (let offset = dataView.byteLength - 22; offset >= 0; offset -= 1) {
     if (dataView.getUint32(offset, true) !== EOCD_SIGNATURE) {
       continue;
     }
 
-    return {
-      totalEntries: dataView.getUint16(offset + 10, true),
-      centralDirectorySize: dataView.getUint32(offset + 12, true),
-      centralDirectoryOffset: dataView.getUint32(offset + 16, true),
-      absoluteOffset: absoluteOffset + offset,
-    };
+    return offset;
   }
 
-  return null;
+  return -1;
+}
+
+function readUint64LE(dataView, offset) {
+  const low = BigInt(dataView.getUint32(offset, true));
+  const high = BigInt(dataView.getUint32(offset + 4, true));
+  return (high << 32n) | low;
+}
+
+function toSafeNumber(value, label) {
+  const maxSafe = BigInt(Number.MAX_SAFE_INTEGER);
+  if (value > maxSafe) {
+    throw new Error(`${label} exceeds browser safe integer range.`);
+  }
+
+  return Number(value);
 }
 
 function decodeText(bytes, encoding) {
