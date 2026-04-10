@@ -109,6 +109,14 @@ h3 {
   color: var(--muted);
 }
 
+.hero-slogan {
+  margin: 0 0 10px;
+  font-family: 'Manrope', sans-serif;
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--accent-2);
+}
+
 .lede {
   max-width: 680px;
   margin-bottom: 0;
